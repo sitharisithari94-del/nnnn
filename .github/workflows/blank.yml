@@ -1,0 +1,128 @@
+name: Ubuntu VPS with Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Keep alive duration (minutes, max 402)'
+        required: false
+        default: '420'
+
+jobs:
+  ubuntu-vps:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server curl wget jq
+          
+      - name: Setup SSH with root password
+        run: |
+          # Set root password
+          echo "root:12345678" | sudo chpasswd
+          
+          # Configure SSH to allow root password authentication
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Restart SSH service
+          sudo service ssh restart
+          sudo service ssh status
+          
+          # Get IP address
+          IP_ADDRESS=$(curl -s ifconfig.me)
+          echo "IP_ADDRESS=$IP_ADDRESS" >> $GITHUB_ENV
+          echo "Local IP: $IP_ADDRESS"
+          
+      - name: Install Bore Tunnel
+        run: |
+          # Get latest release version from GitHub API
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest | jq -r '.tag_name')
+          echo "Latest bore version: $LATEST_VERSION"
+          
+          # Download the correct binary for x86_64 Linux (musl)
+          DOWNLOAD_URL="https://github.com/ekzhang/bore/releases/download/${LATEST_VERSION}/bore-${LATEST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "Downloading from: $DOWNLOAD_URL"
+          
+          curl -L -o /tmp/bore.tar.gz "$DOWNLOAD_URL"
+          
+          # Extract
+          tar -xzf /tmp/bore.tar.gz -C /tmp
+          sudo mv /tmp/bore /usr/local/bin/
+          chmod +x /usr/local/bin/bore
+          
+          # Verify
+          bore --version
+          
+      - name: Start Bore Tunnel
+        run: |
+          # Start bore tunnel for SSH port 22
+          bore local 22 --to bore.pub > bore_output.log 2>&1 &
+          BORE_PID=$!
+          echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
+          
+          # Wait for tunnel to establish
+          sleep 8
+          
+          # Display bore output for debugging
+          echo "--- Bore Output ---"
+          cat bore_output.log
+          echo "-------------------"
+          
+          # Extract the assigned port from bore output
+          # Bore output format: "bore.pub:xxxxx"
+          BORE_PORT=$(grep -oP 'bore.pub:\K[0-9]+' bore_output.log || echo "")
+          
+          # If not found, try alternative patterns
+          if [ -z "$BORE_PORT" ]; then
+            BORE_PORT=$(cat bore_output.log | grep -oP '[0-9]{4,5}' | head -1 || echo "")
+          fi
+          
+          # Validate port
+          if [ -z "$BORE_PORT" ] || [ "$BORE_PORT" = "22" ]; then
+            echo "ERROR: Could not extract valid bore port!"
+            echo "Trying to get port from running process..."
+            sleep 3
+            BORE_PORT=$(cat bore_output.log | grep -oE '[0-9]{4,5}' | tail -1 || echo "ERROR")
+          fi
+          
+          echo "BORE_PORT=$BORE_PORT" >> $GITHUB_ENV
+          echo "::notice::Tunnel established at bore.pub:$BORE_PORT"
+          
+      - name: Display Connection Info
+        run: |
+          echo "=========================================="
+          echo "  🖥️  UBUNTU VPS CONNECTION DETAILS"
+          echo "=========================================="
+          echo ""
+          echo "  Username : root"
+          echo "  Password : 12345678"
+          echo "  IP/Domain: bore.pub"
+          echo "  Port     : ${{ env.BORE_PORT }}"
+          echo ""
+          echo "  SSH Command:"
+          echo "  ssh root@bore.pub -p ${{ env.BORE_PORT }}"
+          echo ""
+          echo "  ⚠️  This runner will terminate after timeout!"
+          echo "  ⏰  Job started at: $(date)"
+          echo "=========================================="
+          
+          # Keep the job alive for the specified duration
+          DURATION=${{ github.event.inputs.duration }}
+          echo "Keeping alive for $DURATION minutes..."
+          sleep $(($DURATION * 60))
+          
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          if [ -n "${{ env.BORE_PID }}" ]; then
+            kill ${{ env.BORE_PID }} 2>/dev/null || true
+          fi
+          echo "Job completed at: $(date)"
